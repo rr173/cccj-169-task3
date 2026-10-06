@@ -208,13 +208,31 @@ $("#upload-start").addEventListener("click", async () => {
   for (let i = 0; i < status.total_chunks; i++) {
     chunks.push(events.slice(i * chunkSize, (i + 1) * chunkSize));
   }
+  let conflicted = false;
   for (let i = 0; i < chunks.length; i++) {
     if (received.has(i)) continue;
-    await api("PUT", `/api/batches/${batch.batch_id}/chunks/${i}`,
-              { events: chunks[i] });
+    try {
+      await api("PUT", `/api/batches/${batch.batch_id}/chunks/${i}`,
+                { events: chunks[i] });
+    } catch (e) {
+      if (e.code === "chunk_conflict") {
+        // 同一分块已收到不同内容：服务器保留首块，重试无意义
+        uploadLog(`块 ${i} 冲突（409）：与已上传内容不一致，已保留首次分块。`
+                  + "请核对本地数据；状态接口仍可补传其余缺失块");
+        conflicted = true;
+        break;
+      }
+      uploadLog(`块 ${i} 上传失败：${e.message}（可查状态后续传）`);
+      conflicted = true;
+      break;
+    }
     $("#upload-bar").style.width =
       `${Math.round(((i + 1) / chunks.length) * 100)}%`;
     uploadLog(`块 ${i} 已上传（${chunks[i].length} 条）`);
+  }
+  if (conflicted) {
+    uploadLog("上传中止：冲突块需人工核对，其余缺失块可在修正后续传");
+    return;
   }
   $("#upload-bar").style.width = "100%";
   uploadLog("全部块已送达，可提交");

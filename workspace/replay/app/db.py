@@ -2,7 +2,8 @@
 
 全部状态落在单个 SQLite 库中。状态迁移的原子性由事务保证（见 guards.py，
 一律 ``BEGIN IMMEDIATE``）。被引用的校正版本由数据库触发器兜底，禁止
-静默覆盖/删除——即使绕过应用层直接写库也会被拒。
+静默覆盖/删除——即使绕过应用层直接写库也会被拒；已收分块（batch_chunks）
+同理：内容一旦首次落库即不可改、不可删，冲突上传只能拿到 409。
 """
 from __future__ import annotations
 
@@ -43,6 +44,7 @@ CREATE TABLE IF NOT EXISTS batch_chunks (
     batch_id    TEXT NOT NULL REFERENCES batches(batch_id),
     chunk_index INTEGER NOT NULL,
     payload     TEXT NOT NULL,          -- JSON 数组：本块的事件列表
+    payload_sha256 TEXT NOT NULL,       -- 首块内容指纹：冲突检测依据
     received_at TEXT NOT NULL,
     PRIMARY KEY (batch_id, chunk_index)
 );
@@ -173,6 +175,22 @@ WHEN EXISTS (SELECT 1 FROM findings  WHERE version_id = OLD.version_id)
 BEGIN
     SELECT RAISE(ABORT, 'version_referenced_immutable');
 END;
+
+-- 分块只接受首次内容：同一 (batch_id, chunk_index) 一旦落库，
+-- 内容既不能改也不能删。即使绕过应用层直接写库（含进程重启后），
+-- 冲突内容也无法替换首块；客户端只能靠状态接口补传缺失块。
+CREATE TRIGGER IF NOT EXISTS trg_chunk_no_update
+BEFORE UPDATE ON batch_chunks
+WHEN NEW.payload_sha256 <> OLD.payload_sha256
+BEGIN
+    SELECT RAISE(ABORT, 'chunk_conflict_immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_chunk_no_delete
+BEFORE DELETE ON batch_chunks
+BEGIN
+    SELECT RAISE(ABORT, 'chunk_immutable');
+END;
 """
 
 
@@ -192,4 +210,28 @@ def connect(db_path: str | None = None) -> sqlite3.Connection:
 
 
 def init_db(conn: sqlite3.Connection) -> None:
+    _migrate(conn)
     conn.executescript(SCHEMA)
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """轻量迁移：老版本库的 batch_chunks 没有 payload_sha256 列，
+    补上并用现有 payload 回填指纹，再由 init_db 挂不可变触发器。"""
+    cols = {r["name"] for r in
+            conn.execute("PRAGMA table_info(batch_chunks)").fetchall()}
+    if cols and "payload_sha256" not in cols:
+        import hashlib
+
+        conn.execute("ALTER TABLE batch_chunks ADD COLUMN "
+                     "payload_sha256 TEXT")
+        rows = conn.execute(
+            "SELECT rowid, payload FROM batch_chunks").fetchall()
+        for r in rows:
+            # 历史 payload 以 canonical 形式落库，直接哈希即可
+            digest = hashlib.sha256(r["payload"].encode("utf-8")).hexdigest()
+            conn.execute(
+                "UPDATE batch_chunks SET payload_sha256 = ? WHERE rowid = ?",
+                (digest, r["rowid"]))
+        # 老触发器（若有）引用旧列定义，统一删后重建
+        conn.execute("DROP TRIGGER IF EXISTS trg_chunk_no_update")
+        conn.execute("DROP TRIGGER IF EXISTS trg_chunk_no_delete")

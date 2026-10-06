@@ -195,6 +195,134 @@ class ReplayTest(unittest.TestCase):
         result = guards.commit_batch(self.conn, batch["batch_id"])
         self.assertEqual(result["inserted"], len(events))
 
+    def test_05a_same_content_replay_returns_idempotent_success(self):
+        events = make_events(n=10, with_anomalies=False)
+        chunks = [events[:5], events[5:]]
+        batch = guards.create_batch(self.conn, {
+            "device_id": self.dev["device_id"],
+            "package_hash": package_hash(events), "total_chunks": 2})
+        first = guards.put_chunk(self.conn, batch["batch_id"], 0,
+                                 {"events": chunks[0]})
+        self.assertNotIn("idempotent_replay", first)
+        # 相同内容重放（键序不同也视为相同：规范化后比较）
+        shuffled = [dict(sorted(e.items(), key=lambda kv: kv[0]))
+                    for e in chunks[0]]
+        replay = guards.put_chunk(self.conn, batch["batch_id"], 0,
+                                  {"events": shuffled})
+        self.assertTrue(replay["idempotent_replay"])
+        row = self.conn.execute(
+            "SELECT payload FROM batch_chunks WHERE batch_id = ? "
+            "AND chunk_index = 0", (batch["batch_id"],)).fetchone()
+        self.assertEqual(row["payload"], canonical(chunks[0]))
+
+    def test_05b_conflicting_chunk_rejected_and_first_kept(self):
+        events = make_events(n=10, with_anomalies=False)
+        chunks = [events[:5], events[5:]]
+        batch = guards.create_batch(self.conn, {
+            "device_id": self.dev["device_id"],
+            "package_hash": package_hash(events), "total_chunks": 2})
+        guards.put_chunk(self.conn, batch["batch_id"], 0,
+                         {"events": chunks[0]})
+        # 同一分块索引收到不同内容 → 409 chunk_conflict
+        tampered = [dict(e) for e in chunks[0]]
+        tampered[0] = dict(tampered[0], value=999.0)
+        with self.assertRaises(ApiError) as cm:
+            guards.put_chunk(self.conn, batch["batch_id"], 0,
+                             {"events": tampered})
+        self.assertEqual(cm.exception.status, 409)
+        self.assertEqual(cm.exception.error, "chunk_conflict")
+        # 首次分块原样保留（payload 与首次一致）
+        row = self.conn.execute(
+            "SELECT payload, received_at FROM batch_chunks "
+            "WHERE batch_id = ? AND chunk_index = 0",
+            (batch["batch_id"],)).fetchone()
+        self.assertEqual(row["payload"], canonical(chunks[0]))
+        # 冲突后相同内容仍幂等成功
+        again = guards.put_chunk(self.conn, batch["batch_id"], 0,
+                                 {"events": chunks[0]})
+        self.assertTrue(again["idempotent_replay"])
+        # 状态接口照常给出缺失块，客户端可继续补传
+        status = guards.batch_status(self.conn, batch["batch_id"])
+        self.assertEqual(status["missing_chunks"], [1])
+        guards.put_chunk(self.conn, batch["batch_id"], 1,
+                         {"events": chunks[1]})
+        result = guards.commit_batch(self.conn, batch["batch_id"])
+        # 提交写入的是首块内容：篡改值 999.0 没有混入事件表
+        self.assertEqual(result["inserted"], len(events))
+        bad = self.conn.execute(
+            "SELECT COUNT(*) AS c FROM raw_events WHERE value = 999.0"
+        ).fetchone()["c"]
+        self.assertEqual(bad, 0)
+
+    def test_05c_conflict_rejected_after_commit_and_process_restart(self):
+        events = make_events(n=10, with_anomalies=False)
+        chunks = [events[:5], events[5:]]
+        batch = guards.create_batch(self.conn, {
+            "device_id": self.dev["device_id"],
+            "package_hash": package_hash(events), "total_chunks": 2})
+        guards.put_chunk(self.conn, batch["batch_id"], 0,
+                         {"events": chunks[0]})
+        guards.put_chunk(self.conn, batch["batch_id"], 1,
+                         {"events": chunks[1]})
+        guards.commit_batch(self.conn, batch["batch_id"])
+        # 提交后重放相同分块 → 幂等成功
+        replay = guards.put_chunk(self.conn, batch["batch_id"], 0,
+                                  {"events": chunks[0]})
+        self.assertTrue(replay["idempotent_replay"])
+        self.assertEqual(replay["status"], "committed")
+        # 提交后重放冲突分块 → 同样拒绝
+        tampered = [dict(e, value=999.0) for e in chunks[1]]
+        with self.assertRaises(ApiError) as cm:
+            guards.put_chunk(self.conn, batch["batch_id"], 1,
+                             {"events": tampered})
+        self.assertEqual(cm.exception.error, "chunk_conflict")
+        self.assertEqual(self.conn.execute(
+            "SELECT COUNT(*) AS c FROM raw_events WHERE value = 999.0"
+        ).fetchone()["c"], 0)
+
+        # 模拟进程重启：关闭连接、重新打开同一数据库
+        self.conn.close()
+        self.conn = dbmod.connect()
+        dbmod.init_db(self.conn)
+        with self.assertRaises(ApiError) as cm:
+            guards.put_chunk(self.conn, batch["batch_id"], 1,
+                             {"events": tampered})
+        self.assertEqual(cm.exception.error, "chunk_conflict")
+        # 重启后状态接口仍可指导续传：已提交批次无缺失块
+        status = guards.batch_status(self.conn, batch["batch_id"])
+        self.assertEqual(status["status"], "committed")
+        self.assertEqual(status["missing_chunks"], [])
+        # 新批次的上传/补传在重启后正常工作
+        events2 = make_events(n=5, with_anomalies=False, uid_prefix="r")
+        chunks2 = [events2[:3], events2[3:]]
+        b2 = guards.create_batch(self.conn, {
+            "device_id": self.dev["device_id"],
+            "package_hash": package_hash(events2), "total_chunks": 2})
+        guards.put_chunk(self.conn, b2["batch_id"], 0,
+                         {"events": chunks2[0]})
+        st = guards.batch_status(self.conn, b2["batch_id"])
+        self.assertEqual(st["missing_chunks"], [1])
+        guards.put_chunk(self.conn, b2["batch_id"], 1,
+                         {"events": chunks2[1]})
+        guards.commit_batch(self.conn, b2["batch_id"])
+
+    def test_05d_chunk_immutability_enforced_by_trigger(self):
+        events = make_events(n=5, with_anomalies=False)
+        batch = guards.create_batch(self.conn, {
+            "device_id": self.dev["device_id"],
+            "package_hash": package_hash(events), "total_chunks": 1})
+        guards.put_chunk(self.conn, batch["batch_id"], 0, {"events": events})
+        # 绕过应用层直接改内容 / 删块 —— 触发器兜底拒绝
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.conn.execute(
+                "UPDATE batch_chunks SET payload = ?, payload_sha256 = 'x' "
+                "WHERE batch_id = ? AND chunk_index = 0",
+                ("[]", batch["batch_id"]))
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.conn.execute(
+                "DELETE FROM batch_chunks WHERE batch_id = ? "
+                "AND chunk_index = 0", (batch["batch_id"],))
+
     def test_06_duplicate_package_is_idempotent(self):
         events = make_events(n=20, with_anomalies=False)
         batch, chunks = self.upload(events, chunk_size=5)

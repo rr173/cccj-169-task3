@@ -4,6 +4,9 @@
 Invariants enforced:
   * 导入批次按 (device_id, package_hash) 幂等；分块逐块落库，commit 前必须
     收齐全部块 —— 支持断点续传；重复 commit / 重复事件不会翻倍。
+  * 分块内容以首次到达为准：同索引相同内容重放幂等成功；内容冲突一律
+    409 chunk_conflict 拒绝且首块不被覆盖（DB 触发器兜底，重启后亦然），
+    冲突内容永远进不了 raw_events；客户端从状态接口只补缺失块。
   * 时钟校正与时间线重建是纯函数：同一批原始事件 → 同一组校正参数 →
     同一条时间线（可复现）。每次重建产生**新版本**，旧版本内容不被触碰。
   * 校正版本一旦被 findings / reports 引用即不可静默覆盖（数据库触发器
@@ -206,25 +209,58 @@ def create_batch(conn: sqlite3.Connection, body: dict) -> dict:
 
 def put_chunk(conn: sqlite3.Connection, batch_id: str, chunk_index: int,
               body: dict) -> dict:
-    """上传一个分块。同一块重复上传幂等覆盖；已提交批次重放块直接返回。"""
+    """上传一个分块（断点续传）。
+
+    同一分块索引的内容**以首次到达为准**：
+
+    * 内容一致（规范化 JSON 相同）→ 幂等成功，首块原样保留；
+    * 内容不一致 → ``409 chunk_conflict`` 拒绝，首块绝不被覆盖；
+    * 已提交批次重放分块同样按内容校验：一致幂等返回，冲突拒绝。
+
+    冲突判定与覆盖保护同时由数据库触发器兜底
+    （``trg_chunk_no_update/trg_chunk_no_delete``），进程重启后依然有效。
+    """
     events = body.get("events")
     if not isinstance(events, list):
         raise ApiError(422, "invalid_chunk", "请求体必须包含 events 数组")
+    payload = canonical(events)
+    digest = sha256_text(payload)
     _begin(conn)
     try:
         b = _get_batch(conn, batch_id)
-        if b["status"] == "committed":
-            conn.execute("COMMIT")
-            return {"batch_id": batch_id, "chunk_index": chunk_index,
-                    "status": "committed", "idempotent_replay": True}
         if not 0 <= chunk_index < b["total_chunks"]:
             raise ApiError(
                 422, "chunk_out_of_range",
                 f"chunk_index 必须在 0..{b['total_chunks'] - 1} 之间")
+        existing = conn.execute(
+            "SELECT payload_sha256 FROM batch_chunks "
+            "WHERE batch_id = ? AND chunk_index = ?",
+            (batch_id, chunk_index)).fetchone()
+        if existing is not None:
+            if existing["payload_sha256"] != digest:
+                raise ApiError(
+                    409, "chunk_conflict",
+                    f"分块 {chunk_index} 已收到不同内容，"
+                    "拒绝覆盖；首块保持不变，请核对后仅补传缺失块")
+            # 相同内容重放：幂等成功，不更新任何字段
+            result = {"batch_id": batch_id, "chunk_index": chunk_index,
+                      "status": "received", "events": len(events),
+                      "idempotent_replay": True}
+            if b["status"] == "committed":
+                result["status"] = "committed"
+            conn.execute("COMMIT")
+            return result
+        if b["status"] == "committed":
+            # 已提交批次缺块属于异常状态：提交后不允许补入新内容，
+            # 冲突/缺失都不能把新数据写进事件表
+            raise ApiError(
+                409, "chunk_after_commit",
+                f"批次已提交，不能再补传缺失分块 {chunk_index}")
         conn.execute(
-            "INSERT OR REPLACE INTO batch_chunks"
-            "(batch_id, chunk_index, payload, received_at) VALUES (?,?,?,?)",
-            (batch_id, chunk_index, canonical(events), now_iso()))
+            "INSERT INTO batch_chunks"
+            "(batch_id, chunk_index, payload, payload_sha256, received_at)"
+            " VALUES (?,?,?,?,?)",
+            (batch_id, chunk_index, payload, digest, now_iso()))
         conn.execute("COMMIT")
         return {"batch_id": batch_id, "chunk_index": chunk_index,
                 "status": "received", "events": len(events)}
