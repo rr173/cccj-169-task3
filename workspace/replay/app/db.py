@@ -139,6 +139,20 @@ CREATE INDEX IF NOT EXISTS idx_findings_device ON findings(device_id);
 CREATE INDEX IF NOT EXISTS idx_findings_version ON findings(version_id);
 CREATE INDEX IF NOT EXISTS idx_history_finding ON review_history(finding_id);
 
+-- 不可变红线：分块落库即不可改写/删除——同一 (batch_id, chunk_index)
+-- 的冲突内容即使绕过应用层也无法覆盖第一次分块（断点续传以首次为准）。
+CREATE TRIGGER IF NOT EXISTS trg_chunk_no_update
+BEFORE UPDATE ON batch_chunks
+BEGIN
+    SELECT RAISE(ABORT, 'chunk_immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_chunk_no_delete
+BEFORE DELETE ON batch_chunks
+BEGIN
+    SELECT RAISE(ABORT, 'chunk_immutable');
+END;
+
 -- 不可变红线：版本一旦被 findings 或 reports 引用，
 -- 其校正参数与校正事件一律禁止 UPDATE/DELETE（只能另建新版本）。
 CREATE TRIGGER IF NOT EXISTS trg_corrected_no_update

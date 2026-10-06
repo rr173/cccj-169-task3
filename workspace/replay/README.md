@@ -18,7 +18,7 @@ python3 -m app 8081              # 启动，浏览器访问 http://localhost:808
 测试：
 
 ```bash
-python3 -m unittest tests.test_replay -v   # 18 个用例（含 HTTP 全链路冒烟）
+python3 -m unittest tests.test_replay -v   # 20 个用例（含 HTTP 全链路冒烟）
 ```
 
 ## 核心不变量（业务红线）
@@ -31,6 +31,9 @@ python3 -m unittest tests.test_replay -v   # 18 个用例（含 HTTP 全链路�
 2. **断点续传**：批次按分块上传（`PUT /api/batches/{id}/chunks/{n}` 逐块落库），
    中断后 `GET /api/batches/{id}` 返回 `received_chunks/missing_chunks`，
    客户端只补缺失块；未收齐时 commit 返回 `409 chunks_missing`（`test_04`）。
+   分块落库即不可变：同一分块索引再次收到**不同内容**返回 `409 chunk_conflict`
+   并保留第一次分块（数据库触发器兜底，提交批次与进程重启后同样生效）；
+   **相同内容**重复上传仍返回幂等成功（`test_18/19`）。
 3. **重复包幂等**：批次按 `(device_id, package_hash)` 唯一，重复创建返回既有批次；
    重复 commit 幂等返回首次结果；事件按 `(device_id, event_uid)` 去重，
    换批次号重传同样的事件一条不增（`test_05/06`）。
@@ -77,7 +80,7 @@ python3 -m unittest tests.test_replay -v   # 18 个用例（含 HTTP 全链路�
 | GET | `/api/versions/{id}/timeline` | 校正事件 ↔ 原始事件对照 |
 | POST | `/api/batches` | 开批次（`device_id/package_hash/total_chunks`，幂等） |
 | GET | `/api/batches/{id}` | 批次状态（断点续传依据） |
-| PUT | `/api/batches/{id}/chunks/{n}` | 上传分块 `{events:[…]}`（可重放） |
+| PUT | `/api/batches/{id}/chunks/{n}` | 上传分块 `{events:[…]}`（同内容幂等；不同内容 `409 chunk_conflict`） |
 | POST | `/api/batches/{id}/commit` | 收齐后提交（幂等） |
 | GET | `/api/findings?device_id=&status=` | 复核项列表 |
 | POST | `/api/findings/{id}/review` | 复核 `{action:accept/reject/return, reviewer, note, review_seq}` |
@@ -104,7 +107,7 @@ app/
   detect.py   连续超限 / 缺失区间 / 计量跳变识别（纯函数）
   guards.py   全部状态迁移（每个迁移一个 BEGIN IMMEDIATE 事务）
   server.py   stdlib HTTP：JSON API + SPA 静态托管
-tests/        18 个端到端不变量用例（含并发复核、失败回滚、HTTP 冒烟）
+tests/        20 个端到端不变量用例（含并发复核、失败回滚、分块冲突、HTTP 冒烟）
 seed.py       演示数据
 web/          index.html / styles.css / app.js（原生 JS SPA）
 ```

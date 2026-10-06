@@ -227,6 +227,78 @@ class ReplayTest(unittest.TestCase):
             (self.dev["device_id"],)).fetchone()["c"]
         self.assertEqual(count, len(events))
 
+    # -- 分块冲突：不同内容拒绝、相同内容幂等 --------------------------------
+    def test_18_conflicting_chunk_rejected_first_chunk_kept(self):
+        events = make_events(n=20, with_anomalies=False)
+        chunks = [events[i:i + 5] for i in range(0, len(events), 5)]
+        batch = guards.create_batch(self.conn, {
+            "device_id": self.dev["device_id"],
+            "package_hash": package_hash(events),
+            "total_chunks": len(chunks)})
+        bid = batch["batch_id"]
+        guards.put_chunk(self.conn, bid, 0, {"events": chunks[0]})
+        guards.put_chunk(self.conn, bid, 1, {"events": chunks[1]})
+        # 相同内容重复上传 → 幂等成功
+        replay = guards.put_chunk(self.conn, bid, 0, {"events": chunks[0]})
+        self.assertTrue(replay["idempotent_replay"])
+        # 同一分块索引、不同内容 → 409，保留第一次分块
+        tampered = [dict(e, value=999.0) for e in chunks[0]]
+        with self.assertRaises(ApiError) as cm:
+            guards.put_chunk(self.conn, bid, 0, {"events": tampered})
+        self.assertEqual(cm.exception.status, 409)
+        self.assertEqual(cm.exception.error, "chunk_conflict")
+        # 数据库触发器兜底：绕过应用层直接改写/删除分块同样被拒
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.conn.execute(
+                "UPDATE batch_chunks SET payload = '[]' WHERE batch_id = ?",
+                (bid,))
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.conn.execute(
+                "DELETE FROM batch_chunks WHERE batch_id = ?", (bid,))
+        # 状态接口仍指引补传缺失块；收齐后提交，事件表只含第一次的内容
+        status = guards.batch_status(self.conn, bid)
+        self.assertEqual(status["received_chunks"], [0, 1])
+        self.assertEqual(status["missing_chunks"],
+                         list(range(2, len(chunks))))
+        for i in status["missing_chunks"]:
+            guards.put_chunk(self.conn, bid, i, {"events": chunks[i]})
+        result = guards.commit_batch(self.conn, bid)
+        self.assertEqual(result["inserted"], len(events))
+        stored = {r["event_uid"]: r["value"] for r in
+                  guards.get_raw_events(self.conn, self.dev["device_id"])}
+        for e in chunks[0]:
+            self.assertEqual(stored[e["uid"]], e.get("value"))  # 非 999.0
+
+    def test_19_committed_batch_conflict_rejected_after_restart(self):
+        events = make_events(n=20, with_anomalies=False)
+        batch, chunks = self.upload(events, chunk_size=5)
+        guards.commit_batch(self.conn, batch["batch_id"])
+        bid = batch["batch_id"]
+        before = guards.get_raw_events(self.conn, self.dev["device_id"])
+        # 已提交批次：相同内容重放幂等成功，不同内容 → 409
+        replay = guards.put_chunk(self.conn, bid, 1, {"events": chunks[1]})
+        self.assertTrue(replay["idempotent_replay"])
+        self.assertEqual(replay["status"], "committed")
+        tampered = [dict(e, value=-1.0) for e in chunks[1]]
+        with self.assertRaises(ApiError) as cm:
+            guards.put_chunk(self.conn, bid, 1, {"events": tampered})
+        self.assertEqual(cm.exception.status, 409)
+        self.assertEqual(cm.exception.error, "chunk_conflict")
+        # 模拟进程重启：关闭连接重开，冲突拒绝与事件表保护依然生效
+        self.conn.close()
+        self.conn = dbmod.connect()
+        dbmod.init_db(self.conn)
+        with self.assertRaises(ApiError) as cm:
+            guards.put_chunk(self.conn, bid, 1, {"events": tampered})
+        self.assertEqual(cm.exception.error, "chunk_conflict")
+        # 冲突内容从未进入事件表；状态接口显示已收齐、无缺失块
+        after = guards.get_raw_events(self.conn, self.dev["device_id"])
+        self.assertEqual([dict(r) for r in before],
+                         [dict(r) for r in after])
+        status = guards.batch_status(self.conn, bid)
+        self.assertEqual(status["status"], "committed")
+        self.assertEqual(status["missing_chunks"], [])
+
     # -- 异常识别 -----------------------------------------------------------
     def test_07_detects_all_three_anomaly_types(self):
         self.build_with_anomalies()

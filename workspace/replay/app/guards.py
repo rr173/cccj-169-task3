@@ -4,6 +4,10 @@
 Invariants enforced:
   * 导入批次按 (device_id, package_hash) 幂等；分块逐块落库，commit 前必须
     收齐全部块 —— 支持断点续传；重复 commit / 重复事件不会翻倍。
+  * 分块落库即不可变：同一 (batch_id, chunk_index) 再次收到**不同内容**
+    一律 409 并保留第一次分块（数据库触发器兜底，重启后同样生效）；
+    相同内容重放幂等成功。已提交批次也按同一规则校验，冲突内容在任何
+    情况下都不会进入事件表。
   * 时钟校正与时间线重建是纯函数：同一批原始事件 → 同一组校正参数 →
     同一条时间线（可复现）。每次重建产生**新版本**，旧版本内容不被触碰。
   * 校正版本一旦被 findings / reports 引用即不可静默覆盖（数据库触发器
@@ -206,25 +210,47 @@ def create_batch(conn: sqlite3.Connection, body: dict) -> dict:
 
 def put_chunk(conn: sqlite3.Connection, batch_id: str, chunk_index: int,
               body: dict) -> dict:
-    """上传一个分块。同一块重复上传幂等覆盖；已提交批次重放块直接返回。"""
+    """上传一个分块。
+
+    断点续传 + 冲突拒绝：同一 (batch_id, chunk_index) 首次落库后不可
+    改写 —— 相同内容重放幂等成功；不同内容 → 409 chunk_conflict，
+    保留第一次分块。已提交批次按同一规则校验（其分块早已收齐），
+    冲突内容在任何情况下都不会进入事件表。
+    """
     events = body.get("events")
     if not isinstance(events, list):
         raise ApiError(422, "invalid_chunk", "请求体必须包含 events 数组")
+    payload = canonical(events)
     _begin(conn)
     try:
         b = _get_batch(conn, batch_id)
-        if b["status"] == "committed":
-            conn.execute("COMMIT")
-            return {"batch_id": batch_id, "chunk_index": chunk_index,
-                    "status": "committed", "idempotent_replay": True}
         if not 0 <= chunk_index < b["total_chunks"]:
             raise ApiError(
                 422, "chunk_out_of_range",
                 f"chunk_index 必须在 0..{b['total_chunks'] - 1} 之间")
+        existing = conn.execute(
+            "SELECT payload FROM batch_chunks "
+            "WHERE batch_id = ? AND chunk_index = ?",
+            (batch_id, chunk_index)).fetchone()
+        if existing is not None:
+            if existing["payload"] != payload:
+                raise ApiError(
+                    409, "chunk_conflict",
+                    f"分块 {chunk_index} 已收到过不同内容，拒绝覆盖；"
+                    "请按批次状态接口的 missing_chunks 续传缺失块")
+            # 相同内容重复上传：幂等成功（已提交批次同样直接确认）
+            conn.execute("COMMIT")
+            return {"batch_id": batch_id, "chunk_index": chunk_index,
+                    "status": b["status"], "events": len(events),
+                    "idempotent_replay": True}
+        if b["status"] == "committed":
+            # commit 前必须收齐全部块，正常不会走到这里；兜底拒绝
+            raise ApiError(409, "batch_already_committed",
+                           "批次已提交，不再接受新分块")
         conn.execute(
-            "INSERT OR REPLACE INTO batch_chunks"
-            "(batch_id, chunk_index, payload, received_at) VALUES (?,?,?,?)",
-            (batch_id, chunk_index, canonical(events), now_iso()))
+            "INSERT INTO batch_chunks(batch_id, chunk_index, payload, "
+            "received_at) VALUES (?,?,?,?)",
+            (batch_id, chunk_index, payload, now_iso()))
         conn.execute("COMMIT")
         return {"batch_id": batch_id, "chunk_index": chunk_index,
                 "status": "received", "events": len(events)}
